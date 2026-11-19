@@ -128,6 +128,7 @@ static std::string handle(const std::string& line, const std::string& token)
          * where cip still sits in ntdll). Fallback: current instruction ptr. */
         std::string module = jsonGet(line, "module");
         std::string addrStr = jsonGet(line, "addr");
+        std::string oepStr = jsonGet(line, "oep");
         duint addr = 0;
         if (!module.empty()) {
             addr = DbgModBaseFromName(module.c_str());
@@ -140,8 +141,15 @@ static std::string handle(const std::string& line, const std::string& token)
             if (DbgGetRegDumpEx(&rd, sizeof(rd))) addr = rd.regcontext.cip;
         }
 
+        uint64_t oepRva = 0;
+        if (!oepStr.empty()) {
+            uint64_t v = strtoull(oepStr.c_str(), nullptr, 0);
+            /* Accept an RVA (0x1440) or a full VA (base+0x1440). */
+            oepRva = (v >= addr && v < addr + 0x40000000) ? (v - addr) : v;
+        }
+
         AutoScyllaResult res;
-        bool ok = AutoScylla_DumpAndFix(addr, path.c_str(), &res);
+        bool ok = AutoScylla_DumpAndFix(addr, path.c_str(), oepRva, &res);
         return reply(id, ok, res.message);
     }
 

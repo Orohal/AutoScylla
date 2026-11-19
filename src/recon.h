@@ -19,5 +19,7 @@ struct AutoScyllaResult {
 };
 
 // Dump the module at 'addr' to 'outPath', reconstruct its imports.
-// Thread-safe enough for the plugin's command handlers.
-bool AutoScylla_DumpAndFix(duint addr, const char* outPath, AutoScyllaResult* res);
+// 'oepRva' (0 = keep current EP) is written to AddressOfEntryPoint when set
+// — needed to make a packed-image dump directly executable.
+bool AutoScylla_DumpAndFix(duint addr, const char* outPath, uint64_t oepRva,
+                           AutoScyllaResult* res);

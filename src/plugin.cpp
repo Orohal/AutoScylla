@@ -25,7 +25,7 @@
 #include "server.h"
 
 #define PLUGIN_NAME  "AutoScylla"
-#define PLUGIN_VER   "0.2.2"
+#define PLUGIN_VER   "0.2.3"
 #define STATUS_FILE  "C:\\Users\\Public\\autoscylla_status.txt"
 
 static int g_pluginHandle = 0;
@@ -104,7 +104,7 @@ static bool CmdFix(int argc, char** argv)
     Log("autoscylla_fix: cip=0x%llX out=%s", (unsigned long long)cip, out);
 
     AutoScyllaResult res;
-    bool ok = AutoScylla_DumpAndFix(cip, out, &res);
+    bool ok = AutoScylla_DumpAndFix(cip, out, 0, &res);
     WriteStatus(ok ? "fixed" : "error", res.message);
     Log("fix: %s (%s)", ok ? "OK" : "FAILED", res.message);
     return ok;
@@ -126,6 +126,7 @@ static bool CmdAutoScylla(int argc, char** argv)
 #define IDD_FIX_DIALOG  2000
 #define IDC_MODULE      2001
 #define IDC_PATH        2002
+#define IDC_OEP         2003
 
 static int  g_hAutoMenu = 0;
 static std::string g_dlgModule;
@@ -165,14 +166,16 @@ static INT_PTR CALLBACK FixDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM)
     if (msg == WM_INITDIALOG) {
         SetDlgItemTextA(hDlg, IDC_MODULE, g_dlgModule.c_str());
         SetDlgItemTextA(hDlg, IDC_PATH, g_dlgPath.c_str());
+        SetDlgItemTextA(hDlg, IDC_OEP, "");
         return TRUE;
     }
     if (msg == WM_COMMAND) {
         switch (LOWORD(wParam)) {
         case IDOK: {
-            char mod[256] = {0}, path[MAX_PATH] = {0};
+            char mod[256] = {0}, path[MAX_PATH] = {0}, oep[64] = {0};
             GetDlgItemTextA(hDlg, IDC_MODULE, mod, sizeof(mod));
             GetDlgItemTextA(hDlg, IDC_PATH, path, sizeof(path));
+            GetDlgItemTextA(hDlg, IDC_OEP, oep, sizeof(oep));
             if (!mod[0] || !path[0]) {
                 MessageBoxA(hDlg, "Bitte Modulname und Ausgabepfad angeben.",
                             PLUGIN_NAME, MB_ICONWARNING);
@@ -186,8 +189,10 @@ static INT_PTR CALLBACK FixDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM)
                 EndDialog(hDlg, IDCANCEL);
                 return TRUE;
             }
+            uint64_t oepRva = oep[0] ? strtoull(oep, nullptr, 0) : 0;
+            if (oepRva >= base && oepRva < base + 0x40000000) oepRva -= base;
             AutoScyllaResult res;
-            bool ok = AutoScylla_DumpAndFix(base, path, &res);
+            bool ok = AutoScylla_DumpAndFix(base, path, oepRva, &res);
             WriteStatus(ok ? "fixed" : "error", res.message);
             g_dlgResult = res.message;
             Log("menu fix: %s (%s)", ok ? "OK" : "FAILED", res.message);

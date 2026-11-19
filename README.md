@@ -4,11 +4,17 @@ Ein **x64dbg-Plugin**, das den Scylla-Workflow (Dump + Import-Reconstruction)
 automatisiert und **echte Rückgabewerte** liefert. Der komplette Ablauf
 `Modul → OEP → IAT → Imports → Dump → Fix → Rebuild` läuft mit einem Aufruf.
 
-> **Status: M1–M7 umgesetzt und verifiziert** (Stand 2026-11-19).
+> **Status: M1–M8 umgesetzt und verifiziert** (Stand 2026-11-19).
 > Getestet gegen notepad.exe am System-Breakpoint **per TCP und über das
 > Plugins-Menü**: `imports=260/0; relocs=4`.
 > **UPX-Sample verifiziert:** echte IAT gefunden (`iat=0x8290/44`),
-> Import-Directory neu gebaut, `imports=43/0` (statt 13 Stub-Imports).
+> Import-Directory neu gebaut, `imports=43/0` (statt 13 Stub-Imports),
+> Relocs (42) und OEP gesetzt.
+>
+> **Bekannte Limitierung:** Der UPX-Dump ist analysefähig (REA/Ghidra),
+> aber noch **nicht direkt startbar** — der Windows-Loader bricht bei der
+> Verarbeitung veralteter Strukturen des gepackten Headers mit `0xC0000005`
+> ab, auch wenn Import/Reloc/TLS korrigiert sind.
 
 ## Inspiration / Danksagung
 
@@ -34,6 +40,10 @@ unter **MIT**, um die Integration in eigene Toolchains zu erlauben.
   Zero-Trennern), jeder Eintrag über die Export-Tabellen der geladenen DLLs in
   `DLL!Funktion` zurückübersetzt und ein **neues Import-Directory** in den Dump
   geschrieben (neue Deskriptoren + INT + Namen, `FirstThunk` = echte IAT).
+- **Reloc-Rebuild für gepackte Images**: scannt das Image nach 8-Byte-Pointern
+  in den eigenen Bildbereich und erzeugt `IMAGE_REL_BASED_DIR64`-Blöcke.
+- **OEP-Setzung**: optionaler `oep`-Parameter (RVA oder VA) setzt
+  `AddressOfEntryPoint` im Dump — auch im `Fix Dump...`-Dialog verfügbar.
 - **Reloc-Validierung**: zählt wohlgeformte Base-Relocation-Blöcke.
 - **Loopback-Control-Server** (M4): JSON-line TCP auf `127.0.0.1:27043`
   mit Token-Schutz — liefert **echte Rückgabewerte**, unabhängig vom
@@ -80,6 +90,19 @@ Anfragen abgelehnt (fail-closed).
 
 Ohne `module`/`addr` wird `cip` als Fallback verwendet — dann darf der
 Debuggee nicht am System-Breakpoint stehen.
+
+`fix` akzeptiert zusätzlich:
+- `oep` — EntryPoint-RVA (z. B. `0x1440`) oder VA; wird in den Dump geschrieben.
+
+**Wichtige Details der Import-Rekonstruktion (PE32+):**
+- INT-Einträge sind **8 Byte** (nicht 4) — die oberen 4 Byte dürfen nicht
+  aus dem alten IAT übrig bleiben.
+- Die Import-Deskriptor-Liste braucht einen **NULL-Terminator**.
+- Die IAT eines gepackten Images kann **DLLs mischen** (ntdll/KERNEL32
+  nebeneinander) — Deskriptoren müssen an **DLL-Wechseln** getrennt werden,
+  sonst sucht der Loader z. B. `GetLastError` in ntdll.
+- UPX-Sections sind `EXEC|READ` ohne `WRITE`; im Dump muss `IMAGE_SCN_MEM_WRITE`
+  gesetzt sein, damit der Loader die IAT füllen kann.
 
 ### x64dbg-Befehle
 

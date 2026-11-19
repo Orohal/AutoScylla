@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <algorithm>
 
 #include "bridgemain.h"
 
@@ -171,17 +172,24 @@ static bool FindRealIat(const std::vector<u8>& mem, u32 imageSize,
     iatRva = best->start;
     iatCount = (u32)best->count;
 
-    /* Split into contiguous sub-runs and resolve each pointer. */
+    /* Split into sub-runs at zeroes AND at DLL changes. The IAT of packed
+     * images interleaves functions from different DLLs (e.g. ntdll and
+     * KERNEL32 side by side); a descriptor must name the DLL of EVERY entry,
+     * otherwise the loader looks up "GetLastError" in ntdll and fails. */
     u32 p = best->start;
     while (p + 8 <= best->end) {
         u64 v = rd64(mem, p);
         if (!v) { p += 8; continue; }
         IatRun run;
         run.rva = p;
+        std::string runDll;
         while (p + 8 <= best->end && rd64(mem, p)) {
             IatSym s;
             s.addr = (duint)rd64(mem, p);
-            if (ResolveIatEntry(s.addr, s.dll, s.fn)) run.syms.push_back(s);
+            if (!ResolveIatEntry(s.addr, s.dll, s.fn)) { p += 8; break; }
+            if (!run.syms.empty() && s.dll != runDll) break;   // DLL change
+            if (run.syms.empty()) runDll = s.dll;
+            run.syms.push_back(s);
             p += 8;
         }
         if (!run.syms.empty()) runs.push_back(run);
@@ -196,7 +204,7 @@ static int RebuildImportDirectory(std::vector<u8>& file,
                                   const std::vector<IatRun>& runs,
                                   u32 iatRva, size_t peOff)
 {
-    size_t need = runs.size() * 20;
+    size_t need = runs.size() * 20 + 20;   // +20: NULL descriptor
     for (const auto& r : runs) {
         need += r.syms.size() * 8 + 8;          // INT entries + terminator
         for (const auto& s : r.syms) need += s.fn.size() + 3;   // hint + name + NUL
@@ -222,7 +230,7 @@ static int RebuildImportDirectory(std::vector<u8>& file,
 
     u32 cur = target->va + 0x100;
     u32 descRva = cur;
-    cur += (u32)runs.size() * 20;
+    cur += (u32)runs.size() * 20 + 20;   // +20: terminating NULL descriptor
     std::vector<u32> intRvas(runs.size());
     for (size_t i = 0; i < runs.size(); i++) {
         intRvas[i] = cur;
@@ -270,13 +278,13 @@ static int RebuildImportDirectory(std::vector<u8>& file,
         d.FirstThunk = r.rva;
         write(descRva + (u32)i * 20, &d, 20);
         for (size_t k = 0; k < r.syms.size(); k++) {
-            u32 entry = nameRvas[ni];
-            write(intRvas[i] + (u32)k * 8, &entry, 4);
-            writeStr(entry, 0, r.syms[k].fn);
+            u64 entry = nameRvas[ni];   // PE32+: 64-bit RVA, not 32-bit!
+            write(intRvas[i] + (u32)k * 8, &entry, 8);
+            writeStr((u32)entry, 0, r.syms[k].fn);
             ni++;
         }
-        u32 term = 0;
-        write(intRvas[i] + (u32)r.syms.size() * 8, &term, 4);   // INT terminator
+        u64 term = 0;
+        write(intRvas[i] + (u32)r.syms.size() * 8, &term, 8);   // INT terminator
         (void)nd;
     }
     /* DLL name strings (unique per symbol index already mapped). */
@@ -291,15 +299,94 @@ static int RebuildImportDirectory(std::vector<u8>& file,
         }
     }
 
+    /* The descriptor array MUST end with an all-zero descriptor — the loader
+     * walks until it sees one (the data-directory size is not authoritative). */
+    IMAGE_IMPORT_DESCRIPTOR nullDesc{};
+    write(descRva + (u32)runs.size() * 20, &nullDesc, sizeof(nullDesc));
+
     /* Point the PE import data directory at the new descriptors. */
     u32 dd = (u32)peOff + 24 + 112;
     write(dd + 8, &descRva, 4);
-    u32 newSize = (u32)runs.size() * 20;
+    u32 newSize = (u32)(runs.size() + 1) * 20;
     write(dd + 12, &newSize, 4);
     return (int)ni;
 }
 
-bool AutoScylla_DumpAndFix(duint addr, const char* outPath, AutoScyllaResult* res)
+/* Rebuild base relocations for a packed image: UPX discards the original
+ * .reloc table but has already applied relocations to the unpacked data.
+ * Scan for 8-byte pointers into the image and emit IMAGE_REL_BASED_DIR64
+ * entries. The dump keeps ImageBase = actual load address, so Windows can
+ * rebase it later using this table. */
+static int RebuildRelocations(std::vector<u8>& file, const std::vector<u8>& mem,
+                              const std::vector<Section>& secs,
+                              duint imageBase, u32 sizeOfImage, size_t peOff,
+                              u32 avoidRva)
+{
+    struct R { u32 page, off; };
+    std::vector<R> rels;
+    u64 hi = imageBase + sizeOfImage;
+    for (u32 o = 0x200; o + 8 <= sizeOfImage; o += 8) {
+        u64 v = rd64(mem, o);
+        if (v >= imageBase && v < hi) rels.push_back({ o & ~0xfffu, o & 0xfffu });
+    }
+    if (rels.empty()) return 0;
+    std::sort(rels.begin(), rels.end(), [](const R& a, const R& b) {
+        return a.page < b.page || (a.page == b.page && a.off < b.off);
+    });
+
+    std::vector<std::vector<u16>> blocks;
+    std::vector<u32> pages;
+    std::vector<u16> cur;
+    u32 curPage = rels[0].page;
+    for (const auto& r : rels) {
+        if (r.page != curPage || cur.size() * 2 + 10 > 0x1000) {
+            blocks.push_back(cur);
+            pages.push_back(curPage);
+            cur.clear();
+            curPage = r.page;
+        }
+        cur.push_back((u16)(0xA000 | r.off));   // IMAGE_REL_BASED_DIR64 (type 10)
+    }
+    if (!cur.empty()) { blocks.push_back(cur); pages.push_back(curPage); }
+
+    size_t total = 0;
+    for (const auto& b : blocks) total += 8 + b.size() * 2;
+    if (!total || total > 0x100000) return 0;
+
+    const Section* target = nullptr;
+    for (const auto& s : secs) {
+        if (s.vsz <= total + 0x1000 + 0x100) continue;
+        if (s.va <= avoidRva && avoidRva < s.va + s.vsz) continue;
+        if (!target || s.vsz > target->vsz) target = &s;
+    }
+    if (!target) return 0;
+
+    u32 firstRva = target->va + 0x1000;   // imports live at +0x100
+    u32 rva = firstRva;
+    size_t off;
+    for (size_t i = 0; i < blocks.size(); i++) {
+        if (!rva2off(secs, rva, off) || off + 8 + blocks[i].size() * 2 > file.size())
+            return 0;
+        u32 page = pages[i], sz = (u32)(8 + blocks[i].size() * 2);
+        memcpy(file.data() + off, &page, 4);
+        memcpy(file.data() + off + 4, &sz, 4);
+        for (size_t k = 0; k < blocks[i].size(); k++)
+            memcpy(file.data() + off + 8 + k * 2, &blocks[i][k], 2);
+        rva += sz;
+    }
+    /* No explicit terminator: the Data Directory size bounds the block list.
+     * (A zero block written from a 4-byte variable caused a malformed 4th
+     *  block and an access violation in the Windows loader.) */
+
+    u32 dd = (u32)peOff + 24 + 112;
+    memcpy(file.data() + dd + 40, &firstRva, 4);
+    u32 relSz = (u32)total;
+    memcpy(file.data() + dd + 44, &relSz, 4);
+    return (int)rels.size();
+}
+
+bool AutoScylla_DumpAndFix(duint addr, const char* outPath, uint64_t oepRva,
+                           AutoScyllaResult* res)
 {
     if (!outPath || !outPath[0]) { result(res, false, "no output path", 0,0,0); return false; }
 
@@ -434,6 +521,8 @@ bool AutoScylla_DumpAndFix(duint addr, const char* outPath, AutoScyllaResult* re
      * at the stub's imports. If the header yielded almost nothing, locate the
      * REAL IAT in memory and rebuild a proper import directory. */
     std::string note;
+    bool iatUsed = false;
+    u32 foundIatRva = 0;
     if (resolved < 20 && sizeOfImage > 0x10000) {
         std::vector<IatRun> runs;
         u32 iatRva = 0, iatCount = 0;
@@ -442,11 +531,43 @@ bool AutoScylla_DumpAndFix(duint addr, const char* outPath, AutoScyllaResult* re
             if (n > resolved) {
                 resolved = n;
                 failed = 0;
+                iatUsed = true;
+                foundIatRva = iatRva;
                 char b[96];
                 snprintf(b, sizeof(b), ";iat=0x%x/%u", iatRva, iatCount);
                 note = b;
             }
         }
+        /* Packed images also lose their original .reloc table. */
+        if (iatUsed) {
+            int nr = RebuildRelocations(file, mem, secs, imageBase, sizeOfImage,
+                                        dos.e_lfanew, foundIatRva);
+            char b[64];
+            snprintf(b, sizeof(b), ";relocbuilt=%d", nr);
+            note += b;
+            blocks = nr ? nr : blocks;
+
+            /* UPX keeps its sections read/execute-only and flips them to
+             * writable at runtime via VirtualProtect. A standalone dump must
+             * be writable itself, otherwise the loader's IAT writes cause an
+             * access violation. */
+            for (u16 i = 0; i < numSections; i++) {
+                size_t sho = sectOff + (size_t)i * sizeof(IMAGE_SECTION_HEADER);
+                u32 ch = rd32(file, sho + 36);
+                ch |= 0x80000000u;   // IMAGE_SCN_MEM_WRITE
+                wr32(file, sho + 36, ch);
+            }
+        }
+    }
+
+    /* Optional OEP (RVA) — makes a packed-image dump directly executable. */
+    if (oepRva && oepRva < sizeOfImage) {
+        u32 ep = (u32)oepRva;
+        size_t epOff = (size_t)dos.e_lfanew + 24 + 16;
+        if (epOff + 4 <= file.size()) memcpy(file.data() + epOff, &ep, 4);
+        char b[48];
+        snprintf(b, sizeof(b), ";oep=0x%x", ep);
+        note += b;
     }
 
     /* Validate relocs (well-formed blocks). */
