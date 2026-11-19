@@ -41,7 +41,7 @@ $rc = "$sdk\Bin\$sdkv\x64\rc.exe"
 if ($LASTEXITCODE -ne 0) { throw "rc failed" }
 
 Write-Host "== Linking AutoScylla.dp64 =="
-& $link /nologo /DLL /SUBSYSTEM:CONSOLE /OUT:build\AutoScylla.dp64 build\plugin.obj build\recon.obj build\server.obj build\plugin.res x64dbg.lib x64bridge.lib
+& $link /nologo /DLL /SUBSYSTEM:CONSOLE /OUT:build\AutoScylla.dp64 build\plugin.obj build\recon.obj build\server.obj build\plugin.res x64dbg.lib x64bridge.lib user32.lib
 if ($LASTEXITCODE -ne 0) { throw "link failed" }
 
 "AutoScylla.dp64: $((Get-Item 'build\AutoScylla.dp64').Length) bytes (C++)"

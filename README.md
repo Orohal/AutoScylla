@@ -4,9 +4,10 @@ Ein **x64dbg-Plugin**, das den Scylla-Workflow (Dump + Import-Reconstruction)
 automatisiert und **echte Rückgabewerte** liefert. Der komplette Ablauf
 `Modul → OEP → IAT → Imports → Dump → Fix → Rebuild` läuft mit einem Aufruf.
 
-> **Status: M1–M4 umgesetzt und verifiziert** (Stand 2026-11-19).
-> Getestet gegen notepad.exe am System-Breakpoint:
-> `imports=260/0; relocs=4`, Dump = gültige PE x64 (7 Sections, 28 DLLs).
+> **Status: M1–M5 umgesetzt und verifiziert** (Stand 2026-11-19).
+> Getestet gegen notepad.exe am System-Breakpoint **sowohl per TCP-Aufruf als
+> auch über das Plugins-Menü**: `imports=260/0; relocs=4`, Dump = gültige PE x64
+> (7 Sections, 28 DLLs).
 
 ## Inspiration / Danksagung
 
@@ -31,6 +32,22 @@ unter **MIT**, um die Integration in eigene Toolchains zu erlauben.
 - **Loopback-Control-Server** (M4): JSON-line TCP auf `127.0.0.1:27043`
   mit Token-Schutz — liefert **echte Rückgabewerte**, unabhängig vom
   Debug-State / der Command-Box.
+- **Minimales GUI** (M5): `Plugins → AutoScylla` mit `Fix Dump...`,
+  `Status...` und `About` — für manuelles Arbeiten ohne Agent/MCP.
+
+## Manuelle Bedienung (GUI)
+
+Im x64dbg-Menü `Plugins → AutoScylla`:
+
+| Eintrag | Funktion |
+|---|---|
+| **Fix Dump...** | Öffnet einen Dialog: Modulname (z. B. `notepad.exe`) und Ausgabe-Pfad eingeben, mit OK den Fix starten. Das Ergebnis erscheint in einer Message-Box (`base=…;size=…;imports=…/…;relocs=…`). |
+| **Status...** | Zeigt Version, Debug-State, `cip` + Modul, Server-Port und die Befehle. |
+| **About** | Version, Lizenz und Danksagung an die Scylla-Autoren. |
+
+Der Modulname kann aus dem x64dbg-`Modules`-Tab kopiert werden. Am
+System-Breakpoint (cip in `ntdll`) bleibt das Feld bewusst leer — bitte Modul
+von Hand angeben.
 
 ## Verwendung (MCP / Automatisierung)
 
