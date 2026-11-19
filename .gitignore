@@ -1,0 +1,11 @@
+# Build artifacts
+build/
+*.obj
+*.res
+*.exp
+*.lib
+*.pdb
+
+# Runtime outputs (contain no source)
+autoscylla_status.txt
+autoscylla_dump.exe
