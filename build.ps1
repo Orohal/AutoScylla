@@ -29,7 +29,11 @@ $link = "$vc\bin\Hostx64\x64\link.exe"
 
 Write-Host "== Compiling plugin.cpp (C++) =="
 & $cl /nologo /EHsc /MD /c /O2 /W3 /D_WIN64 /Fo:build\plugin.obj src\plugin.cpp
-if ($LASTEXITCODE -ne 0) { throw "cl failed" }
+if ($LASTEXITCODE -ne 0) { throw "cl failed (plugin.cpp)" }
+& $cl /nologo /EHsc /MD /c /O2 /W3 /D_WIN64 /Fo:build\recon.obj src\recon.cpp
+if ($LASTEXITCODE -ne 0) { throw "cl failed (recon.cpp)" }
+& $cl /nologo /EHsc /MD /c /O2 /W3 /D_WIN64 /Fo:build\server.obj src\server.cpp
+if ($LASTEXITCODE -ne 0) { throw "cl failed (server.cpp)" }
 
 Write-Host "== Compiling version resource (x64dbg needs .rsrc) =="
 $rc = "$sdk\Bin\$sdkv\x64\rc.exe"
@@ -37,7 +41,7 @@ $rc = "$sdk\Bin\$sdkv\x64\rc.exe"
 if ($LASTEXITCODE -ne 0) { throw "rc failed" }
 
 Write-Host "== Linking AutoScylla.dp64 =="
-& $link /nologo /DLL /SUBSYSTEM:CONSOLE /OUT:build\AutoScylla.dp64 build\plugin.obj build\plugin.res x64dbg.lib x64bridge.lib
+& $link /nologo /DLL /SUBSYSTEM:CONSOLE /OUT:build\AutoScylla.dp64 build\plugin.obj build\recon.obj build\server.obj build\plugin.res x64dbg.lib x64bridge.lib
 if ($LASTEXITCODE -ne 0) { throw "link failed" }
 
 "AutoScylla.dp64: $((Get-Item 'build\AutoScylla.dp64').Length) bytes (C++)"
