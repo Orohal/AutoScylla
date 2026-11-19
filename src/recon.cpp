@@ -64,6 +64,241 @@ static void result(AutoScyllaResult* r, bool ok, const char* msg,
     snprintf(r->message, sizeof(r->message), "%s", msg ? msg : "");
 }
 
+/* UPX (and other packers) rebuild the IAT at runtime and clear the original
+ * lookup table (OFT == 0) plus all hint/name strings. The IAT then contains
+ * already-resolved absolute addresses. Recover the function name by looking
+ * the address up in the containing module's export table.
+ * System DLLs are mapped at the same address in every process, so this works
+ * from the plugin (x64dbg) process as well. */
+static bool NameFromAddress(duint addr, std::string& name)
+{
+    HMODULE h = nullptr;
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            (LPCSTR)addr, &h))
+        return false;
+    auto* dos = (IMAGE_DOS_HEADER*)h;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    auto* nt = (IMAGE_NT_HEADERS*)((BYTE*)h + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+    IMAGE_DATA_DIRECTORY ed = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!ed.VirtualAddress || !ed.Size) return false;
+    auto* exp = (IMAGE_EXPORT_DIRECTORY*)((BYTE*)h + ed.VirtualAddress);
+    auto* funcs = (DWORD*)((BYTE*)h + exp->AddressOfFunctions);
+    auto* names = (DWORD*)((BYTE*)h + exp->AddressOfNames);
+    auto* ords  = (WORD*)((BYTE*)h + exp->AddressOfNameOrdinals);
+    for (DWORD i = 0; i < exp->NumberOfNames; i++) {
+        DWORD rva = funcs[ords[i]];
+        if (rva && (duint)((BYTE*)h + rva) == addr) {
+            name = (char*)((BYTE*)h + names[i]);
+            return true;
+        }
+    }
+    return false;
+}
+
+/* ---- IAT search + import-directory rebuild (for packed images) ---- */
+
+struct IatSym { duint addr; std::string dll, fn; };
+struct IatRun { u32 rva; std::vector<IatSym> syms; };
+
+static std::string BaseNameA(const std::string& p)
+{
+    size_t s = p.find_last_of("\\/");
+    return s == std::string::npos ? p : p.substr(s + 1);
+}
+
+/* Resolve a resolved IAT pointer to DLL + function name. */
+static bool ResolveIatEntry(duint addr, std::string& dll, std::string& fn)
+{
+    HMODULE h = nullptr;
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            (LPCSTR)addr, &h)) return false;
+    char path[MAX_PATH]{};
+    GetModuleFileNameA(h, path, MAX_PATH);
+    dll = BaseNameA(path);
+    fn.clear();
+
+    auto* dos = (IMAGE_DOS_HEADER*)h;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    auto* nt = (IMAGE_NT_HEADERS*)((BYTE*)h + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+    IMAGE_DATA_DIRECTORY ed = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!ed.VirtualAddress || !ed.Size) return false;
+    auto* exp = (IMAGE_EXPORT_DIRECTORY*)((BYTE*)h + ed.VirtualAddress);
+    auto* funcs = (DWORD*)((BYTE*)h + exp->AddressOfFunctions);
+    auto* names = (DWORD*)((BYTE*)h + exp->AddressOfNames);
+    auto* ords  = (WORD*)((BYTE*)h + exp->AddressOfNameOrdinals);
+    for (DWORD i = 0; i < exp->NumberOfNames; i++) {
+        DWORD rva = funcs[ords[i]];
+        if (rva && (duint)((BYTE*)h + rva) == addr) {
+            fn = (char*)((BYTE*)h + names[i]);
+            return !fn.empty();
+        }
+    }
+    return false;
+}
+
+/* Find the most likely real IAT: a region with many consecutive (or
+ * zero-separated) 8-byte pointers into loaded DLLs. */
+static bool FindRealIat(const std::vector<u8>& mem, u32 imageSize,
+                        std::vector<IatRun>& runs, u32& iatRva, u32& iatCount)
+{
+    u32 limit = imageSize < 0x400000u ? imageSize : 0x400000u;
+    auto isPtr = [](u64 v) -> bool {
+        return v >= 0x0000700000000000ULL && v <= 0x00007FFFFFFFFFFFULL;
+    };
+    struct Cand { u32 start, end; int count; };
+    std::vector<Cand> cands;
+    u32 start = 0, last = 0;
+    int cnt = 0;
+    for (u32 o = 0x1000; o + 8 <= limit; o += 8) {
+        if (!isPtr(rd64(mem, o))) continue;
+        if (cnt && (o - last) <= 0x40) {
+            cnt++;
+        } else {
+            if (cnt >= 8) cands.push_back({ start, last + 8, cnt });
+            start = o; cnt = 1;
+        }
+        last = o;
+    }
+    if (cnt >= 8) cands.push_back({ start, last + 8, cnt });
+    if (cands.empty()) return false;
+
+    const Cand* best = &cands[0];
+    for (const auto& c : cands) if (c.count > best->count) best = &c;
+    iatRva = best->start;
+    iatCount = (u32)best->count;
+
+    /* Split into contiguous sub-runs and resolve each pointer. */
+    u32 p = best->start;
+    while (p + 8 <= best->end) {
+        u64 v = rd64(mem, p);
+        if (!v) { p += 8; continue; }
+        IatRun run;
+        run.rva = p;
+        while (p + 8 <= best->end && rd64(mem, p)) {
+            IatSym s;
+            s.addr = (duint)rd64(mem, p);
+            if (ResolveIatEntry(s.addr, s.dll, s.fn)) run.syms.push_back(s);
+            p += 8;
+        }
+        if (!run.syms.empty()) runs.push_back(run);
+    }
+    return !runs.empty();
+}
+
+/* Write a fresh import directory (descriptors + INT + names) into 'file',
+ * reusing the REAL IAT as FirstThunk. Returns number of resolved imports. */
+static int RebuildImportDirectory(std::vector<u8>& file,
+                                  const std::vector<Section>& secs,
+                                  const std::vector<IatRun>& runs,
+                                  u32 iatRva, size_t peOff)
+{
+    size_t need = runs.size() * 20;
+    for (const auto& r : runs) {
+        need += r.syms.size() * 8 + 8;          // INT entries + terminator
+        for (const auto& s : r.syms) need += s.fn.size() + 3;   // hint + name + NUL
+        for (const auto& s : r.syms) {
+            bool seen = false;
+            for (const auto& t : r.syms) {
+                if (&t == &s) break;
+                if (t.dll == s.dll) { seen = true; break; }
+            }
+            if (!seen) need += s.dll.size() + 1;
+        }
+    }
+    if (!need) return 0;
+
+    /* Choose the largest section that does not contain the IAT. */
+    const Section* target = nullptr;
+    for (const auto& s : secs) {
+        if (s.vsz <= need + 0x200) continue;
+        if (iatRva >= s.va && iatRva < s.va + s.vsz) continue;  // never overwrite the IAT
+        if (!target || s.vsz > target->vsz) target = &s;
+    }
+    if (!target) return 0;
+
+    u32 cur = target->va + 0x100;
+    u32 descRva = cur;
+    cur += (u32)runs.size() * 20;
+    std::vector<u32> intRvas(runs.size());
+    for (size_t i = 0; i < runs.size(); i++) {
+        intRvas[i] = cur;
+        cur += (u32)runs[i].syms.size() * 8 + 8;   // +8: NULL terminator
+    }
+    std::vector<u32> nameRvas;
+    for (const auto& r : runs)
+        for (const auto& s : r.syms) { nameRvas.push_back(cur); cur += (u32)s.fn.size() + 3; }
+    std::vector<u32> dllRvas;
+    for (const auto& r : runs) {
+        std::string lastDll;
+        for (const auto& s : r.syms) {
+            if (s.dll == lastDll) { dllRvas.push_back(dllRvas.back()); continue; }
+            lastDll = s.dll;
+            dllRvas.push_back(cur);
+            cur += (u32)s.dll.size() + 1;
+        }
+    }
+    if (cur >= target->va + target->vsz) return 0;
+
+    size_t off;
+    auto write = [&](u32 rva, const void* src, size_t n) {
+        if (rva2off(secs, rva, off) && off + n <= file.size())
+            memcpy(file.data() + off, src, n);
+    };
+    auto writeStr = [&](u32 rva, u16 hint, const std::string& s) {
+        if (!rva2off(secs, rva, off) || off + 2 + s.size() + 1 > file.size()) return;
+        memcpy(file.data() + off, &hint, 2);
+        memcpy(file.data() + off + 2, s.data(), s.size());
+        file[off + 2 + s.size()] = 0;
+    };
+    /* DLL names are plain C strings — no 2-byte hint! */
+    auto writeCStr = [&](u32 rva, const std::string& s) {
+        if (!rva2off(secs, rva, off) || off + s.size() + 1 > file.size()) return;
+        memcpy(file.data() + off, s.data(), s.size());
+        file[off + s.size()] = 0;
+    };
+
+    size_t ni = 0, nd = 0;
+    for (size_t i = 0; i < runs.size(); i++) {
+        const auto& r = runs[i];
+        IMAGE_IMPORT_DESCRIPTOR d{};
+        d.OriginalFirstThunk = intRvas[i];
+        d.Name = dllRvas[ni];
+        d.FirstThunk = r.rva;
+        write(descRva + (u32)i * 20, &d, 20);
+        for (size_t k = 0; k < r.syms.size(); k++) {
+            u32 entry = nameRvas[ni];
+            write(intRvas[i] + (u32)k * 8, &entry, 4);
+            writeStr(entry, 0, r.syms[k].fn);
+            ni++;
+        }
+        u32 term = 0;
+        write(intRvas[i] + (u32)r.syms.size() * 8, &term, 4);   // INT terminator
+        (void)nd;
+    }
+    /* DLL name strings (unique per symbol index already mapped). */
+    size_t di = 0;
+    for (const auto& r : runs) {
+        std::string lastDll;
+        for (const auto& s : r.syms) {
+            if (s.dll == lastDll) { di++; continue; }
+            lastDll = s.dll;
+            writeCStr(dllRvas[di], s.dll);
+            di++;
+        }
+    }
+
+    /* Point the PE import data directory at the new descriptors. */
+    u32 dd = (u32)peOff + 24 + 112;
+    write(dd + 8, &descRva, 4);
+    u32 newSize = (u32)runs.size() * 20;
+    write(dd + 12, &newSize, 4);
+    return (int)ni;
+}
+
 bool AutoScylla_DumpAndFix(duint addr, const char* outPath, AutoScyllaResult* res)
 {
     if (!outPath || !outPath[0]) { result(res, false, "no output path", 0,0,0); return false; }
@@ -99,6 +334,11 @@ bool AutoScylla_DumpAndFix(duint addr, const char* outPath, AutoScyllaResult* re
 
     size_t sectOff = dos.e_lfanew + sizeof(IMAGE_NT_HEADERS64);
     std::vector<Section> secs;
+    /* Lay out sections sequentially. NEVER trust PointerToRawData from the
+     * in-memory header: UPX0 has raw=0 and would overwrite the PE header.
+     * We assign fresh aligned raw offsets and write them back into the output
+     * section headers so RVAs still map correctly. */
+    u32 nextRaw = ((sizeOfHeaders + fileAlign - 1) / fileAlign) * fileAlign;
     for (u16 i = 0; i < numSections; i++) {
         IMAGE_SECTION_HEADER sh;
         if (!DbgMemRead(imageBase + sectOff + i * sizeof(sh), &sh, sizeof(sh))) continue;
@@ -111,13 +351,24 @@ bool AutoScylla_DumpAndFix(duint addr, const char* outPath, AutoScyllaResult* re
         s.raw = sh.PointerToRawData;
         secs.push_back(s);
 
-        u32 va = s.va, raw = s.raw, vsz = s.vsz;
+        u32 va = s.va, vsz = s.vsz;
         if (!va || !vsz || va >= sizeOfImage) continue;
         u32 copy = vsz < (sizeOfImage - va) ? vsz : (sizeOfImage - va);
-        if (raw + copy > file.size()) copy = (raw < file.size()) ? (u32)(file.size() - raw) : 0;
+        u32 aligned = ((copy + fileAlign - 1) / fileAlign) * fileAlign;
+        u32 raw = nextRaw;
+        if ((u64)raw + aligned > file.size()) {
+            aligned = copy;
+            if ((u64)raw + copy > file.size())
+                copy = (raw < file.size()) ? (u32)(file.size() - raw) : 0;
+        }
         if (copy) memcpy(file.data() + raw, mem.data() + va, copy);
-        sh.SizeOfRawData = ((copy + fileAlign - 1) / fileAlign) * fileAlign;
+        sh.PointerToRawData = raw;
+        sh.SizeOfRawData = aligned;
         memcpy(file.data() + sectOff + i * sizeof(sh), &sh, sizeof(sh));
+        s.raw = raw;
+        s.rawsz = aligned;
+        secs.back() = s;
+        nextRaw = raw + aligned;
     }
 
     /* ---- Import reconstruction (ImportRecon logic) ---- */
@@ -142,17 +393,27 @@ bool AutoScylla_DumpAndFix(duint addr, const char* outPath, AutoScyllaResult* re
             HMODULE h = LoadLibraryA(dll.c_str());
             if (!h) { failed++; p += 20; continue; }
 
-            size_t oftOff, iatOff;
-            bool haveOft = rva2off(secs, oft, oftOff);
-            bool haveIat = rva2off(secs, firstThunk, iatOff);
-            if (!haveOft || !haveIat) { p += 20; continue; }
+            size_t iatOff = 0;
+            if (!rva2off(secs, firstThunk, iatOff)) { p += 20; continue; }
+
+            /* OFT == 0: the loader consumed the lookup table, the IAT holds
+             * resolved absolute addresses (classic UPX case). Recover names
+             * from the export tables instead of reading hint/name RVAs. */
+            size_t lookupOff = 0;
+            bool lookupValid = (oft != 0) && rva2off(secs, oft, lookupOff);
+            bool resolvedIat = !lookupValid;
 
             const u64 ordinalFlag = (1ULL << 63);
             for (int ti = 0; ti < 8192; ti++) {
-                u64 entry = rd64(file, oftOff + (size_t)ti * 8);
+                u64 entry = rd64(file, (resolvedIat ? iatOff : lookupOff) + (size_t)ti * 8);
                 if (entry == 0) break;
                 FARPROC proc = nullptr;
-                if (entry & ordinalFlag) {
+                if (resolvedIat) {
+                    std::string fn;
+                    if (NameFromAddress((duint)entry, fn) && !fn.empty())
+                        proc = GetProcAddress(h, fn.c_str());
+                    if (!proc) proc = (FARPROC)entry;   // keep the working address
+                } else if (entry & ordinalFlag) {
                     proc = GetProcAddress(h, MAKEINTRESOURCEA((u32)(entry & 0xFFFF)));
                 } else {
                     size_t hintOff;
@@ -166,6 +427,25 @@ bool AutoScylla_DumpAndFix(duint addr, const char* outPath, AutoScyllaResult* re
                 else failed++;
             }
             p += 20;
+        }
+    }
+
+    /* Packed images (UPX etc.) keep a stale header import table that points
+     * at the stub's imports. If the header yielded almost nothing, locate the
+     * REAL IAT in memory and rebuild a proper import directory. */
+    std::string note;
+    if (resolved < 20 && sizeOfImage > 0x10000) {
+        std::vector<IatRun> runs;
+        u32 iatRva = 0, iatCount = 0;
+        if (FindRealIat(mem, sizeOfImage, runs, iatRva, iatCount)) {
+            int n = RebuildImportDirectory(file, secs, runs, iatRva, dos.e_lfanew);
+            if (n > resolved) {
+                resolved = n;
+                failed = 0;
+                char b[96];
+                snprintf(b, sizeof(b), ";iat=0x%x/%u", iatRva, iatCount);
+                note = b;
+            }
         }
     }
 
@@ -191,8 +471,9 @@ bool AutoScylla_DumpAndFix(duint addr, const char* outPath, AutoScyllaResult* re
     fclose(of);
 
     char msg[256];
-    snprintf(msg, sizeof(msg), "base=0x%llX;size=%u;imports=%d/%d;relocs=%d",
-             (unsigned long long)imageBase, (u32)written, resolved, failed, blocks);
+    snprintf(msg, sizeof(msg), "base=0x%llX;size=%u;imports=%d/%d;relocs=%d%s",
+             (unsigned long long)imageBase, (u32)written, resolved, failed, blocks,
+             note.c_str());
     result(res, written == file.size(), msg, resolved, failed, blocks);
     return written == file.size();
 }

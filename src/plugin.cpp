@@ -25,7 +25,7 @@
 #include "server.h"
 
 #define PLUGIN_NAME  "AutoScylla"
-#define PLUGIN_VER   "0.2.1"
+#define PLUGIN_VER   "0.2.2"
 #define STATUS_FILE  "C:\\Users\\Public\\autoscylla_status.txt"
 
 static int g_pluginHandle = 0;

@@ -4,10 +4,11 @@ Ein **x64dbg-Plugin**, das den Scylla-Workflow (Dump + Import-Reconstruction)
 automatisiert und **echte Rückgabewerte** liefert. Der komplette Ablauf
 `Modul → OEP → IAT → Imports → Dump → Fix → Rebuild` läuft mit einem Aufruf.
 
-> **Status: M1–M5 umgesetzt und verifiziert** (Stand 2026-11-19).
-> Getestet gegen notepad.exe am System-Breakpoint **sowohl per TCP-Aufruf als
-> auch über das Plugins-Menü**: `imports=260/0; relocs=4`, Dump = gültige PE x64
-> (7 Sections, 28 DLLs).
+> **Status: M1–M7 umgesetzt und verifiziert** (Stand 2026-11-19).
+> Getestet gegen notepad.exe am System-Breakpoint **per TCP und über das
+> Plugins-Menü**: `imports=260/0; relocs=4`.
+> **UPX-Sample verifiziert:** echte IAT gefunden (`iat=0x8290/44`),
+> Import-Directory neu gebaut, `imports=43/0` (statt 13 Stub-Imports).
 
 ## Inspiration / Danksagung
 
@@ -28,6 +29,11 @@ unter **MIT**, um die Integration in eigene Toolchains zu erlauben.
   schreibt eine saubere File-Layout-PE (Sections, Header, Relocs).
 - **Import-Reconstruction**: löst jede IAT-Platzhalter-Adresse über
   `LoadLibraryA` + `GetProcAddress` auf (nach-name und nach-Ordinal).
+- **IAT-Suche für gepackte Images**: wenn der Header nur wenige Imports liefert
+  (UPX-Fall), wird die echte IAT im Speicher gefunden (Pointer-Arrays mit
+  Zero-Trennern), jeder Eintrag über die Export-Tabellen der geladenen DLLs in
+  `DLL!Funktion` zurückübersetzt und ein **neues Import-Directory** in den Dump
+  geschrieben (neue Deskriptoren + INT + Namen, `FirstThunk` = echte IAT).
 - **Reloc-Validierung**: zählt wohlgeformte Base-Relocation-Blöcke.
 - **Loopback-Control-Server** (M4): JSON-line TCP auf `127.0.0.1:27043`
   mit Token-Schutz — liefert **echte Rückgabewerte**, unabhängig vom
